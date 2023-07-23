@@ -2,3 +2,7 @@
 /output/**/*.csv
 *.pyc
 *.zip
+*.whl
+surprise/
+.vscode/
+*.csv
