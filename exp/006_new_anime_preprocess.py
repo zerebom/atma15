@@ -32,7 +32,6 @@ from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split, GroupKFold
 
 from atma15.eda import visualize_importance
-from atma15.features.features import MemberRatio, TargetEncoding, ExplicitFeature, SeverScale
 from atma15.model import lgb_params, run_lgb
 
 pl.Config.set_fmt_str_lengths(100)
@@ -63,7 +62,7 @@ id_cols = ["anime_id", "user_id"]
 
 raw_train = pl.read_csv(f"{input_dir}/train.csv")
 raw_test = pl.read_csv(f"{input_dir}/test.csv")
-anime = pl.read_csv(f"{input_dir}/anime_preprocessed_v2.csv")
+anime = pl.read_csv(f"{input_dir}/anime.csv")
 sub = pl.read_csv(f"{input_dir}/sample_submission.csv")
 
 #%%
@@ -242,3 +241,5 @@ anime = get_original_work_name(anime)
 
 anime.write_csv("../input/anime_preprocessed_v2.csv")
 
+
+# %%

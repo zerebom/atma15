@@ -1,17 +1,14 @@
-import polars as pl
-from surprise import Dataset, Reader
-from surprise.prediction_algorithms.knns import KNNBaseline
-import pandas as pd
-
-from sklearn.model_selection import BaseCrossValidator
-
-from tqdm import tqdm
-import numpy as np
-from numpy.linalg import norm
-from sklearn.decomposition import TruncatedSVD
-
 import random
+
+import numpy as np
+import pandas as pd
+import polars as pl
 from gensim.models import word2vec
+from numpy.linalg import norm
+from scipy.sparse import csr_matrix
+from sklearn.decomposition import TruncatedSVD
+from sklearn.model_selection import BaseCrossValidator
+from tqdm import tqdm
 
 
 class Feature:
@@ -20,6 +17,84 @@ class Feature:
 
     def transform(self, df):
         pass
+
+
+def cos_sim(v1, v2):
+    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+
+class Implict(Feature):
+    def __init__(self, train_df, test_df, model, prefix: str) -> None:
+        super().__init__()
+        src_df = pl.concat(
+            (train_df[["user_id", "anime_id"]], test_df[["user_id", "anime_id"]])
+        )
+
+        self.uid2idx = {
+            k: idx for idx, k in enumerate(src_df["user_id"].unique().sort())
+        }
+        self.aid2idx = {
+            k: idx for idx, k in enumerate(src_df["anime_id"].unique().sort())
+        }
+        self.idx2uid = {v: k for k, v in self.uid2idx.items()}
+        self.idx2aid = {v: k for k, v in self.aid2idx.items()}
+
+        src_df = src_df.with_columns(
+            [
+                pl.col("user_id").map_dict(self.uid2idx).alias("user_idx"),
+                pl.col("anime_id").map_dict(self.aid2idx).alias("anime_idx"),
+            ]
+        )
+        self.model = model
+        self.prefix = prefix
+        self.csr_data = csr_matrix(
+            (
+                np.ones(len(src_df)),
+                (src_df["user_idx"].to_numpy(),src_df["anime_idx"].to_numpy()),
+            )
+        )
+        self.src_df = src_df
+
+    def fit(self, df):
+        self.model.fit(self.csr_data)
+        self.src_df = self.calc_sim(self.src_df)
+
+        self.anime_emb_df = pl.DataFrame(self.model.item_factors).select(
+            [
+                pl.all().prefix(f"{self.prefix}_a_"),
+                pl.Series(self.aid2idx.keys()).alias("anime_id"),
+            ]
+        )
+
+        self.user_emb_df = pl.DataFrame(self.model.user_factors).select(
+            [pl.all().prefix(f"{self.prefix}_u_"), pl.Series(self.uid2idx.keys()).alias("user_id")]
+        )
+        key_cols = ["user_id", "anime_id"]
+        df = df.join(self.anime_emb_df, on="anime_id", how="left")
+        df = df.join(self.user_emb_df, on="user_id", how="left")
+        df = df.join(
+            self.src_df[key_cols + [f"{self.prefix}_sim"]], on=key_cols, how="left"
+        )
+        return df
+
+    def transform(self, df):
+        key_cols = ["user_id", "anime_id"]
+        df = df.join(self.anime_emb_df, on="anime_id", how="left")
+        df = df.join(self.user_emb_df, on="user_id", how="left")
+        df = df.join(
+            self.src_df[key_cols + [f"{self.prefix}_sim"]], on=key_cols, how="left"
+        )
+        return df
+
+    def calc_sim(self, df):
+        item_arr = self.model.item_factors
+        user_arr = self.model.user_factors
+        sim_list = []
+        for aid, uid in zip(df["anime_idx"].to_numpy(), df["user_idx"].to_numpy()):
+            sim_list.append(cos_sim(item_arr[aid], user_arr[uid]))
+
+        df = df.with_columns(pl.Series(sim_list).alias(f"{self.prefix}_sim"))
+        return df
 
 
 class CFEmb(Feature):
@@ -113,9 +188,13 @@ class CF(Feature):
 
 
 class W2V(Feature):
-    def __init__(self) -> None:
+    def __init__(
+        self, n_components: int = 20, window: int = 5, embedding_size: int = 32
+    ) -> None:
         super().__init__()
-        self.n_components = 10
+        self.window = window
+        self.embedding_size = embedding_size
+        self.n_components = n_components
         self.svd = TruncatedSVD(n_components=self.n_components)
         self.svg_fitted = False
 
@@ -154,16 +233,15 @@ class W2V(Feature):
         df = df.with_columns(pl.Series(l).alias("w2v_sim"))
         return df
 
-    @staticmethod
     def attach_emb_by_cols(
-        df: pl.DataFrame, key_col: str, emb_dic: dict, emb_dim: int = 10
+        self, df: pl.DataFrame, key_col: str, emb_dic: dict
     ) -> pl.DataFrame:
         df = (
             df.with_columns([pl.col(key_col).map_dict(emb_dic).alias("emb_dic")])
             .with_columns(
                 [
                     pl.col("emb_dic").list.get(i).alias(f"emb_{key_col}_{i}")
-                    for i in range(emb_dim)
+                    for i in range(self.n_components)
                 ]
             )
             .drop("emb_dic")
@@ -180,9 +258,8 @@ class W2V(Feature):
         svg_factors = {k: v for k, v in zip(factors.keys(), svd_arr)}
         return svg_factors
 
-    @staticmethod
     def calc_w2v_features_dict(
-        train_df: pl.DataFrame, SEED=42
+        self, train_df: pl.DataFrame, SEED=42
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         df = train_df.to_pandas()
 
@@ -211,9 +288,9 @@ class W2V(Feature):
         train_sentence_list = title_sentence_list + shuffled_sentence_list
 
         # word2vecのパラメータ
-        vector_size = 64
         w2v_params = {
-            "vector_size": vector_size,  ## <= 変更点
+            "vector_size": self.embedding_size,  ## <= 変更点
+            "window": self.window,
             "seed": SEED,
             "min_count": 1,
             "workers": 32,
@@ -278,41 +355,41 @@ class SeverScale(Feature):
         return self.fit(df)
 
 
-class ExplicitFeature:
-    def __init__(self, algo=KNNBaseline()):
-        self.algo = algo
-        self.feat_name = algo.__class__.__name__
+# class ExplicitFeature:
+#     def __init__(self, algo=KNNBaseline()):
+#         self.algo = algo
+#         self.feat_name = algo.__class__.__name__
 
-    def fit(self, df: pl.DataFrame) -> pl.DataFrame:
-        input_df = df.to_pandas()
+#     def fit(self, df: pl.DataFrame) -> pl.DataFrame:
+#         input_df = df.to_pandas()
 
-        reader = Reader(rating_scale=(1, 10))
-        data = Dataset.load_from_df(input_df[["user_id", "anime_id", "score"]], reader)
-        train_data = data.build_full_trainset()
+#         reader = Reader(rating_scale=(1, 10))
+#         data = Dataset.load_from_df(input_df[["user_id", "anime_id", "score"]], reader)
+#         train_data = data.build_full_trainset()
 
-        self.algo.fit(train_data)
+#         self.algo.fit(train_data)
 
-        print("train Predict")
-        train_predictions = self.algo.test(train_data.build_testset())
-        est_train_ratings = [pred.est for pred in train_predictions]
+#         print("train Predict")
+#         train_predictions = self.algo.test(train_data.build_testset())
+#         est_train_ratings = [pred.est for pred in train_predictions]
 
-        df = df.with_columns(pl.Series(est_train_ratings).alias(self.feat_name))
-        return df
+#         df = df.with_columns(pl.Series(est_train_ratings).alias(self.feat_name))
+#         return df
 
-    def transform(self, df: pl.DataFrame) -> pl.DataFrame:
-        input_df = df.to_pandas()
-        input_df["score"] = 0
-        reader = Reader(rating_scale=(1, 10))
-        test_data = Dataset.load_from_df(
-            input_df[["user_id", "anime_id", "score"]], reader
-        )
-        # testset = test_data.construct_testset(input_df[['user_id', 'anime_id', 'score']].values.tolist())  # transform to testset format
+#     def transform(self, df: pl.DataFrame) -> pl.DataFrame:
+#         input_df = df.to_pandas()
+#         input_df["score"] = 0
+#         reader = Reader(rating_scale=(1, 10))
+#         test_data = Dataset.load_from_df(
+#             input_df[["user_id", "anime_id", "score"]], reader
+#         )
+#         # testset = test_data.construct_testset(input_df[['user_id', 'anime_id', 'score']].values.tolist())  # transform to testset format
 
-        print("test Predict")
-        predictions = self.algo.test(test_data.build_full_trainset().build_testset())
-        est_ratings = [pred.est for pred in predictions]
-        df = df.with_columns(pl.Series(est_ratings).alias(self.feat_name))
-        return df
+#         print("test Predict")
+#         predictions = self.algo.test(test_data.build_full_trainset().build_testset())
+#         est_ratings = [pred.est for pred in predictions]
+#         df = df.with_columns(pl.Series(est_ratings).alias(self.feat_name))
+#         return df
 
 
 class MemberRatio(Feature):
@@ -334,20 +411,11 @@ class MemberRatio(Feature):
 class TargetEncoding(Feature):
     def __init__(
         self,
-        target_col: str,
         agg_dict: dict[tuple[str, str], list[str]],
         fold_instance: BaseCrossValidator,
         min_count: int = 5,
     ):
         self.agg_dict = agg_dict
-        self.agg_expr = {
-            "mean": pl.col(target_col).mean(),
-            "sum": pl.col(target_col).sum(),
-            "count": pl.col(target_col).count(),
-            "std": pl.col(target_col).std(),
-            "min": pl.col(target_col).min(),
-            "max": pl.col(target_col).max(),
-        }
         self.fold_instance = fold_instance
         self.min_count = min_count
 
@@ -364,12 +432,13 @@ class TargetEncoding(Feature):
         input_df = df.filter(pl.col("user_id").is_in(user_ids))
 
         for (key_col, target_col), agg_func_list in self.agg_dict.items():
+            agg_expr = self.create_agg_expr(target_col)
             for agg_func_str in agg_func_list:
                 te_col = f"te_{key_col}_{agg_func_str}_{target_col}"
 
                 d = (
                     input_df.groupby([key_col])
-                    .agg(self.agg_expr[agg_func_str])
+                    .agg(agg_expr[agg_func_str])
                     .to_pandas()
                     .set_index(key_col)
                     .to_dict()[target_col]
@@ -392,3 +461,14 @@ class TargetEncoding(Feature):
 
             df = df.with_columns(pl.col(key_col).map_dict(d).alias(te_col))
         return df
+
+    def create_agg_expr(self, target_col):
+        agg_expr = {
+            "mean": pl.col(target_col).mean(),
+            "sum": pl.col(target_col).sum(),
+            "count": pl.col(target_col).count(),
+            "std": pl.col(target_col).std(),
+            "min": pl.col(target_col).min(),
+            "max": pl.col(target_col).max(),
+        }
+        return agg_expr

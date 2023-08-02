@@ -12,26 +12,19 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import seaborn as sns
+from implicit.als import AlternatingLeastSquares
+from implicit.cpu.bpr import BayesianPersonalizedRanking
 from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import KFold, StratifiedKFold, train_test_split, GroupKFold
+from sklearn.model_selection import GroupKFold, StratifiedKFold
 
 from atma15.eda import visualize_importance
-from atma15.features.features import (
-    MemberRatio,
-    TargetEncoding,
-    ExplicitFeature,
-    SeverScale,
-    W2V,
-    CF,
-    CFEmb,
-)
+from atma15.features.features import W2V, CFEmb, Implict, MemberRatio, TargetEncoding
 from atma15.model import lgb_params, run_lgb
 from atma15.utils import seed_everything
 
 seed_everything(42)
 pl.Config.set_fmt_str_lengths(100)
 
-# %%
 exp_name = Path(os.path.basename(__file__)).stem
 input_dir = "../input"
 output_dir = "../output"
@@ -79,8 +72,9 @@ if not "row_nr" in raw_test.columns:
     raw_test = raw_test.with_row_count()
 
 train_y = raw_train[["row_nr", "score"]]
-X_test = join_anime(raw_test, anime)
+raw_X_test = join_anime(raw_test, anime)
 raw_train = join_anime(raw_train, anime)
+
 
 # %%
 
@@ -107,16 +101,32 @@ def split_generator(
 agg_dict = {
     ("user_id", "score"): ["mean", "sum", "count", "std", "min", "max"],
     ("anime_id", "score"): ["mean", "sum", "count", "std", "min", "max"],
-    # ("original_work_name", "score"): ["mean", "sum", "count", "std", "min", "max"],
-    # ("source", "score"): ["mean", "sum", "count", "std", "min", "max"],
+    # ("original_work_name", "score"): ["mean", "sum", "count", "std"],
+    ("user_id", "members"): ["mean", "sum", "count", "std"],
+    ("user_id", "watching"): ["mean", "sum", "count", "std"],
+    ("user_id", "completed"): ["mean", "sum", "count", "std"],
+    ("user_id", "on_hold"): ["mean", "sum", "count", "std"],
+    ("user_id", "dropped"): ["mean", "sum", "count", "std"],
+    ("anime_id", "members"): ["mean", "sum", "count", "std"],
+    ("anime_id", "watching"): ["mean", "sum", "count", "std"],
+    ("anime_id", "completed"): ["mean", "sum", "count", "std"],
+    ("anime_id", "on_hold"): ["mean", "sum", "count", "std"],
+    ("anime_id", "dropped"): ["mean", "sum", "count", "std"],
 }
 
 
+als = AlternatingLeastSquares(
+    factors=64, regularization=0.05, alpha=2.0, calculate_training_loss=True
+)
+bpr = BayesianPersonalizedRanking()
+
 features = [
-    CFEmb(),
+    Implict(raw_train, raw_test, als, "als"),
+    Implict(raw_train, raw_test, bpr, "bpr"),
+    TargetEncoding(agg_dict, st_folds),
+    # CFEmb(),
     W2V(),
     MemberRatio(),
-    TargetEncoding("score", agg_dict, st_folds),
 ]
 
 drop_cols = str_cols + id_cols
@@ -131,20 +141,19 @@ def drop_untrainable_cols(df, drop_cols):
         df = df.drop("row_nr")
     return df
 
-
-# %%
-oof_preds_list = []
-preds_list = []
-model_list = []
-
-
+#%%
 for X_train, X_val, y_train, y_val, train_idx, val_idx in split_generator(
     raw_train, train_y, st_folds
 ):
+
+    X_test = raw_X_test
+    print(X_train.shape, X_val.shape, raw_X_test.shape)
     for f in features:
         X_train = f.fit(X_train)
         X_val = f.transform(X_val)
         X_test = f.transform(X_test)
+
+    print(X_train.shape, X_val.shape, X_test.shape)
 
     X_num_train = drop_untrainable_cols(X_train, drop_cols)
     X_num_val = drop_untrainable_cols(X_val, drop_cols)
@@ -164,12 +173,10 @@ for X_train, X_val, y_train, y_val, train_idx, val_idx in split_generator(
 
 # break
 # %%
-visualize_importance(model_list, X_num_train)
+[len(p) for p in oof_preds_list]
 
-# %%
-X_test.columns
-
-
+#%%
+visualize_importance(model_list, X_num_train, n_top=100)
 
 # %%
 
@@ -191,7 +198,6 @@ def calc_oof_rmse(
     print("oof_rmse_str:", oof_rmse_str)
     return oof_rmse, oof_rmse_str, all_oof_df
 
-
 def save_pred(
     preds_list: list[np.ndarray], exp_dir: Path, oof_rmse: str
 ) -> pl.DataFrame:
@@ -208,19 +214,10 @@ def save_pred(
     return sub_df, path
 
 
-oof_rmse, oof_rmse_str, all_oof_df = calc_oof_rmse(raw_train, oof_preds_list)
-sub_df, save_path = save_pred(preds_list, exp_dir, oof_rmse)
+# oof_rmse, oof_rmse_str, all_oof_df = calc_oof_rmse(raw_train, oof_preds_list)
+sub_df, save_path = save_pred(preds_list, exp_dir, "unknown")
 oof_path = Path(exp_dir) / (Path(save_path).stem + "_oof.csv")
-all_oof_df.with_columns(raw_train["score"]).write_csv(oof_path)
-
-# %%
-
-
-# %%
-
-
-# %%
-all_oof_df.with_columns(pl.col(["user_id"]))
+# all_oof_df.with_columns(raw_train["score"]).write_csv(oof_path)
 
 
 # %%
@@ -232,11 +229,6 @@ raw_test = raw_test.with_columns(
     .otherwise(0)
     .alias("is_train_user")
 )
-# %%
-
-# raw_train(pl.col("anime_id").count().over('user_id').alias("user_cnt")).filter(pl.col("user_cnt")<5)['user_id']
-# %%
-
 
 # %%
 plt.hist(
@@ -246,11 +238,11 @@ plt.hist(
 
 # %%
 
-another_pred_path = "/home/wantedly565/repo/atma15/output/004_surprise/submission_2023_07_17_00_51_19_1.1906.csv"
+another_pred_path = "/Users/wantedly565/ghq/github.com/zerebom/atma15/output/004_surprise/submission_2023_07_17_00_51_19_1.1906.csv"
 another_pred_s = pl.read_csv(another_pred_path)["score"]
 
 # %%
-type(another_pred_s)
+anime
 
 # %%
 

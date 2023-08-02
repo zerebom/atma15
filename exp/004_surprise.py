@@ -18,8 +18,6 @@ from atma15.eda import visualize_importance
 from atma15.features.features import MemberRatio, TargetEncoding
 from atma15.model import lgb_params, run_lgb
 import pandas as pd
-from surprise import Dataset,Reader, SVD,KNNBaseline
-from surprise.model_selection import cross_validate
 
 #%%
 

@@ -3,7 +3,7 @@ import pandas as pd
 import seaborn as sns
 
 
-def visualize_importance(models, feat_train_df):
+def visualize_importance(models, feat_train_df,n_top=50):
     feature_importance_df = pd.DataFrame()
     for i, model in enumerate(models):
         _df = pd.DataFrame()
@@ -18,7 +18,7 @@ def visualize_importance(models, feat_train_df):
         feature_importance_df.groupby("column")
         .sum()[["feature_importance"]]
         .sort_values("feature_importance", ascending=False)
-        .index[:50]
+        .index[:n_top]
     )
 
     fig, ax = plt.subplots(figsize=(12, max(4, len(order) * 0.2)))
